@@ -11,20 +11,16 @@
   <div class="shell">
     <header class="topbar">
       <div class="topbar-row">
-        <div class="brand">
-          <span class="brand-dot" id="status-dot"></span>
-          <h1 class="brand-title">AGY Monitor</h1>
-          <span class="badge" id="model-badge">--</span>
-        </div>
-        <div class="topbar-actions">
-          <button type="button" class="icon-btn" id="cdp-pill" title="查看输入框胶囊状态">胶囊: 检测中</button>
-          <button type="button" class="icon-btn" id="refresh-btn" title="立即刷新">刷新</button>
-        </div>
-      </div>
-
-      <div class="conv-row">
         <select id="conv-select" class="conv-select" aria-label="选择会话"></select>
-        <span class="updated-at" id="updated-at">--</span>
+        <div class="topbar-actions">
+          <button type="button" class="icon-btn" id="cdp-pill" title="查看输入框胶囊状态">胶囊</button>
+          <button type="button" class="icon-btn icon-only" id="refresh-btn" title="立即刷新" aria-label="立即刷新">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+              <polyline points="21 3 21 9 15 9" />
+            </svg>
+          </button>
+        </div>
       </div>
 
       <div id="cdp-hint" class="cdp-hint hidden">

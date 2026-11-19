@@ -1,7 +1,7 @@
 {
   "name": "agy-monitor",
   "displayName": "AGY Monitor",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Antigravity 2.0 上下文窗口、TPS/TTFT、缓存命中与 API 费用监控（含可选输入框胶囊）| Monitor context window, TPS/TTFT, cache hit rate, and API cost in Antigravity 2.0.",
   "logo": "assets/logo.svg",
   "author": {

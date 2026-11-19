@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { createConnection } from 'node:net';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Response, SidecarApp } from 'sidecar_sdk';
@@ -139,11 +140,48 @@ function pickActiveConversation(requestedConvId) {
 }
 
 let ticking = false;
+let lsMissCount = 0;
+
+function parseAssignedLsEndpoint() {
+  const raw = (process.env.ANTIGRAVITY_LS_ADDRESS || '').trim();
+  if (!raw) return null;
+  try {
+    const normalized = raw.includes('://') ? raw : `http://${raw}`;
+    const u = new URL(normalized);
+    const port = Number(u.port);
+    return u.hostname && port > 0 ? { host: u.hostname, port } : null;
+  } catch {
+    return null;
+  }
+}
+
+function probeTcp(host, port) {
+  return new Promise((resolve) => {
+    const sock = createConnection({ host, port });
+    const done = (ok) => {
+      sock.destroy();
+      resolve(ok);
+    };
+    sock.setTimeout(1000, () => done(false));
+    sock.once('connect', () => done(true));
+    sock.once('error', () => done(false));
+  });
+}
+
+const assignedLs = parseAssignedLsEndpoint();
 
 async function backgroundTick(isInitial = false) {
   if (ticking) return;
   ticking = true;
   try {
+    if (assignedLs) {
+      const alive = await probeTcp(assignedLs.host, assignedLs.port);
+      lsMissCount = alive ? 0 : lsMissCount + 1;
+      if (lsMissCount >= 3) {
+        shutdown();
+        return;
+      }
+    }
     await pricingCatalog.refreshIfNeeded();
     const uiActive = Date.now() - cache.lastUiPollAt < ACTIVE_CLIENT_WINDOW_MS;
     const cdpAttached = cdpManager.status.state === 'attached';
@@ -166,18 +204,24 @@ for (const [route, [file, contentType]] of Object.entries(STATIC)) {
   app.api(route, () => new Response(readFileSync(join(__dirname, file), 'utf-8'), { contentType }), 'GET');
 }
 
-app.api('/api/telemetry', (data) => {
+app.api('/api/telemetry', async (data) => {
   cache.lastUiPollAt = Date.now();
-  const convId = pickActiveConversation(data?.conversationId);
+  let convId = pickActiveConversation(data?.conversationId);
   const force = data?.refresh === '1' || data?.refresh === 'true';
 
-  if (force || !cache.lastConvFetchAt) {
-    void refreshConversations(force);
+  if (force) {
+    await refreshConversations(true);
+    convId = pickActiveConversation(data?.conversationId);
+    if (convId) await refreshTelemetry(convId, true);
+  } else {
+    if (!cache.lastConvFetchAt) void refreshConversations(false);
+    const cached = convId ? cache.telemetryByConv.get(convId) : null;
+    if (convId && (!cached || Date.now() - cached.fetchedAt >= STALE_CACHE_MS)) {
+      void refreshTelemetry(convId, false);
+    }
   }
+
   const entry = convId ? cache.telemetryByConv.get(convId) : null;
-  if (convId && (force || !entry || Date.now() - entry.fetchedAt >= STALE_CACHE_MS)) {
-    void refreshTelemetry(convId, force);
-  }
 
   const etag = computeTelemetryEtag(convId, entry?.data, cdpManager.status.state);
   if (!force && data?.etag && data.etag === etag && entry?.data) {
@@ -206,10 +250,13 @@ void backgroundTick(true);
 const timer = setInterval(() => void backgroundTick(), POLL_INTERVAL_MS);
 timer.unref?.();
 
-process.on('SIGTERM', () => {
+function shutdown() {
   clearInterval(timer);
-  cdpManager.closeAll();
+  cdpManager.closeAll(true);
   process.exit(0);
-});
+}
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
 
 app.run();

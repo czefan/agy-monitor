@@ -126,14 +126,18 @@
     const hint = $('cdp-hint');
     if (!cdp) return;
     pill.dataset.state = cdp.state || 'unknown';
+    pill.textContent = '胶囊';
     if (cdp.state === 'attached') {
-      pill.textContent = `胶囊: 已挂载 (${cdp.targets})`;
+      pill.title = `输入框胶囊已挂载到 ${cdp.targets} 个窗口（点击查看详情）`;
       hint.textContent = `已连接桌面端调试端口（127.0.0.1:${cdp.port}），输入框胶囊已挂载到 ${cdp.targets} 个窗口。`;
+    } else if (cdp.state === 'standby') {
+      pill.title = '由其他活跃窗口挂载胶囊（点击查看详情）';
+      hint.textContent = '检测到另一个活跃窗口的 AGY Monitor 实例正在挂载胶囊，当前实例保持待命以避免冲突。';
     } else if (cdp.state === 'port_not_enabled') {
-      pill.textContent = '胶囊: 未开 CDP';
+      pill.title = '未检测到调试端口，点击查看开启方法';
       hint.textContent = '未检测到桌面端调试端口（DevToolsActivePort），因此输入框胶囊暂未挂载。若需开启，请为 Antigravity 桌面快捷方式添加启动参数 --remote-debugging-port=0 并重启应用。';
     } else {
-      pill.textContent = '胶囊: 未连接';
+      pill.title = '输入框胶囊暂未挂载（点击查看状态）';
       hint.textContent = `当前未挂载输入框胶囊（状态: ${cdp.detail || cdp.state || 'unknown'}）。`;
     }
   }
@@ -159,7 +163,6 @@
 
   function renderContext(ctx) {
     const level = ctx.level || 'ok';
-    $('status-dot').dataset.level = level;
     const lvlEl = $('ctx-level');
     lvlEl.dataset.level = level;
     lvlEl.textContent = level === 'danger' ? '危险 · 建议 /compact' : level === 'warn' ? '预警 (>=80%)' : '正常';
@@ -278,7 +281,6 @@
     if (payload.etag) lastEtag = payload.etag;
     renderCdp(payload.cdp);
     if (payload.unchanged) {
-      if (payload.updatedAt) $('updated-at').textContent = new Date(payload.updatedAt).toLocaleTimeString();
       return;
     }
 
@@ -286,8 +288,6 @@
     renderConversations(payload.conversations, payload.conversationId);
 
     if (!t) {
-      $('model-badge').textContent = payload.loading ? '加载中…' : payload.error ? '连接异常' : '暂无数据';
-      $('updated-at').textContent = '--';
       renderContext({ used: 0, limit: 0, pct: 0, level: 'ok', checkpointCount: 0, groups: [], heavyConsumers: [] });
       $('kpi-tps').textContent = '--';
       $('kpi-tps-sub').textContent = '会话均值 --';
@@ -305,9 +305,6 @@
       renderTurns([], 0);
       return;
     }
-
-    $('model-badge').textContent = t.model || '--';
-    $('updated-at').textContent = t.updatedAt ? new Date(t.updatedAt).toLocaleTimeString() : '--';
 
     renderContext(t.context || {});
 
@@ -378,7 +375,23 @@
     void refresh(true);
   });
 
-  $('refresh-btn').addEventListener('click', () => void refresh(true));
+  let doneTimer = null;
+  $('refresh-btn').addEventListener('click', async () => {
+    const btn = $('refresh-btn');
+    if (btn.disabled) return;
+    clearTimeout(doneTimer);
+    delete btn.dataset.done;
+    btn.disabled = true;
+    btn.classList.add('spinning');
+    try {
+      await Promise.all([refresh(true), new Promise((r) => setTimeout(r, 420))]);
+      btn.dataset.done = 'true';
+      doneTimer = setTimeout(() => { delete btn.dataset.done; }, 900);
+    } finally {
+      btn.classList.remove('spinning');
+      btn.disabled = false;
+    }
+  });
 
   $('cdp-pill').addEventListener('click', () => {
     $('cdp-hint').classList.toggle('hidden');

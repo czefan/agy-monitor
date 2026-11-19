@@ -1,7 +1,60 @@
-import { existsSync, readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import { UUID_RE } from './telemetry.mjs';
+
+const CDP_LOCK_FILE = join(process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR || tmpdir(), 'agy-monitor-cdp.lock.json');
+const CDP_LEASE_TTL_MS = 10_000;
+const INSTANCE_STARTED_AT = Date.now();
+
+function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err?.code === 'EPERM';
+  }
+}
+
+/**
+ * Coordinate CDP ownership across sidecar processes so only one instance writes to the UI.
+ */
+function acquireCdpLease() {
+  const now = Date.now();
+  try {
+    if (existsSync(CDP_LOCK_FILE)) {
+      const cur = JSON.parse(readFileSync(CDP_LOCK_FILE, 'utf-8'));
+      const fresh = cur && Number(cur.ts) > now - CDP_LEASE_TTL_MS;
+      const otherPid = Number(cur?.pid);
+      if (fresh && otherPid && otherPid !== process.pid && isPidAlive(otherPid)) {
+        // Yield to a newer sidecar process or the current active lease holder.
+        const otherStarted = Number(cur.startedAt || 0);
+        if (otherStarted > INSTANCE_STARTED_AT || (otherStarted === INSTANCE_STARTED_AT && otherPid > process.pid)) {
+          return false;
+        }
+      }
+    }
+    mkdirSync(dirname(CDP_LOCK_FILE), { recursive: true });
+    writeFileSync(
+      CDP_LOCK_FILE,
+      JSON.stringify({ pid: process.pid, startedAt: INSTANCE_STARTED_AT, ts: now }),
+    );
+    return true;
+  } catch {
+    return true;
+  }
+}
+
+function releaseCdpLease() {
+  try {
+    if (!existsSync(CDP_LOCK_FILE)) return;
+    const cur = JSON.parse(readFileSync(CDP_LOCK_FILE, 'utf-8'));
+    if (Number(cur?.pid) === process.pid) unlinkSync(CDP_LOCK_FILE);
+  } catch {
+    // Ignore cleanup errors on exit.
+  }
+}
 
 /**
  * Candidate DevToolsActivePort file locations for Antigravity Desktop across OSes.
@@ -48,11 +101,13 @@ export function readDevToolsActivePort() {
  * Runs inside the Electron renderer via Runtime.evaluate.
  */
 const CAPSULE_SCRIPT = `(() => {
-  const VERSION = 1;
-  if (window.__agyMonitor?.version === VERSION) {
+  const VERSION = 2;
+  const curVer = window.__agyMonitor?.version || 0;
+  if (curVer >= VERSION) {
     return {
       mounted: Boolean(document.getElementById('agy-monitor-capsule-root')?.isConnected),
       convId: window.__agyMonitor.getConvId(),
+      stale: curVer > VERSION,
     };
   }
 
@@ -80,7 +135,7 @@ const CAPSULE_SCRIPT = `(() => {
       '.agy-mon-ring-arc { fill: none; stroke: #10b981; stroke-width: 2.2; stroke-linecap: round; transition: stroke-dashoffset 200ms ease, stroke 200ms ease; }',
       '.agy-mon-pill[data-level="warn"] .agy-mon-ring-arc { stroke: #f59e0b; }',
       '.agy-mon-pill[data-level="danger"] .agy-mon-ring-arc { stroke: #ef4444; }',
-      '#' + POPOVER_ID + ' { position: fixed; left: 8px; top: 8px; width: max-content; min-width: 286px; max-width: calc(100vw - 16px); padding: 10px 14px; border-radius: 8px; border: 1px solid rgba(128,128,128,0.25); background: var(--background, #18181b); color: var(--foreground, #f4f4f5); box-shadow: 0 8px 24px rgba(0,0,0,0.22); font-size: 12px; line-height: 1.5; display: none; z-index: 99999; font-variant-numeric: tabular-nums; }',
+      '#' + POPOVER_ID + ' { position: fixed; left: 8px; top: 8px; width: max-content; min-width: 304px; max-width: calc(100vw - 16px); padding: 11px 15px; border-radius: 8px; border: 1px solid rgba(128,128,128,0.25); background: var(--background, #18181b); color: var(--foreground, #f4f4f5); box-shadow: 0 8px 24px rgba(0,0,0,0.22); font-size: 13px; line-height: 1.5; display: none; z-index: 99999; font-variant-numeric: tabular-nums; }',
       '#' + POPOVER_ID + '[data-open="true"] { display: block; }',
       '.agy-mon-pop-grid { display: grid; grid-template-columns: auto auto; justify-content: space-between; gap: 6px 18px; }',
       '.agy-mon-pop-k { opacity: 0.72; white-space: nowrap; }',
@@ -289,10 +344,9 @@ const CAPSULE_SCRIPT = `(() => {
       const fmtUsd = (v) => (typeof v !== 'number' ? '--' : (v > 0 && v < 0.01 ? '$' + v.toFixed(4) : '$' + v.toFixed(2)));
       const usedStr = fmtNum(data?.context?.used || 0);
       const limitStr = fmtNum(data?.context?.limit || 0);
-      const compacts = Number(data?.context?.checkpointCount || 0);
       const ctxText = (limitStr !== '0' ? usedStr + ' / ' + limitStr : usedStr) + ' · ' + pct.toFixed(1) + '%';
       setRows(pop, [
-        ['上下文窗口', ctxText + (compacts > 0 ? ' (压缩 ' + compacts + ' 次)' : '')],
+        ['上下文窗口', ctxText],
         ['本轮 / 平均 TPS', (typeof tps === 'number' ? tps.toFixed(1) : '--') + ' / ' + (typeof avgTps === 'number' ? avgTps.toFixed(1) : '--') + ' tok/s'],
         ['本轮 / 中位 TTFT', (typeof ttft === 'number' ? ttft.toFixed(2) : '--') + ' / ' + (typeof medTtft === 'number' ? medTtft.toFixed(2) : '--') + ' s'],
         ['本轮 / 累计缓存', (typeof latestCachePct === 'number' ? latestCachePct.toFixed(1) + '%' : '--') + ' / ' + (typeof cachePct === 'number' ? cachePct.toFixed(1) + '%' : '--')],
@@ -399,7 +453,6 @@ function buildCapsulePayload(payload) {
       used: payload?.context?.used || 0,
       limit: payload?.context?.limit || 0,
       pct: payload?.context?.pct || 0,
-      checkpointCount: payload?.context?.checkpointCount || 0,
     },
     latest: {
       tps: payload?.latest?.tps ?? null,
@@ -429,6 +482,12 @@ export class CapsuleManager {
   }
 
   async tick(fallbackConvId) {
+    if (!acquireCdpLease()) {
+      this.closeAll();
+      this.status = { state: 'standby', port: null, targets: 0, detail: 'Handled by active sidecar instance' };
+      return this.status;
+    }
+
     const now = Date.now();
     if (this.status.state === 'port_not_enabled' && now - this.lastPortCheckAt < 10_000) {
       return this.status;
@@ -484,6 +543,7 @@ export class CapsuleManager {
         try {
           const evalRes = await client.evaluate(CAPSULE_SCRIPT);
           const meta = evalRes?.result?.value || {};
+          if (meta.stale) continue;
           const convId = UUID_RE.test(meta.convId) ? meta.convId : fallbackConvId;
           if (convId) {
             const payload = await this.getTelemetryForConv(convId);
@@ -517,9 +577,10 @@ export class CapsuleManager {
     }
   }
 
-  closeAll() {
+  closeAll(releaseLease = false) {
     for (const client of this.clients.values()) client.close();
     this.clients.clear();
     this.lastPushedByTarget.clear();
+    if (releaseLease) releaseCdpLease();
   }
 }
