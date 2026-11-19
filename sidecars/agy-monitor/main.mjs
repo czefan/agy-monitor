@@ -15,6 +15,7 @@ const STATIC = {
 
 const POLL_INTERVAL_MS = 2000;
 const STALE_CACHE_MS = 1800;
+const IDLE_CACHE_MAX_MS = 60_000;
 const ACTIVE_CLIENT_WINDOW_MS = 10_000;
 const MAX_CACHED_CONVS = 20;
 
@@ -77,18 +78,44 @@ async function refreshConversations(force = false) {
 
 async function refreshTelemetry(convId, force = false) {
   if (!convId || !UUID_RE.test(convId)) return null;
+  const now = Date.now();
   const existing = cache.telemetryByConv.get(convId);
-  if (!force && existing && Date.now() - existing.fetchedAt < STALE_CACHE_MS) {
+  if (!force && existing && now - existing.fetchedAt < STALE_CACHE_MS) {
     return existing.data;
   }
+
+  const convMeta = cache.conversations.find((c) => c.id === convId);
+  const children = cache.childrenByRoot.get(convId) || [];
+  const fingerprint = convMeta
+    ? [
+        convMeta.status,
+        convMeta.stepCount,
+        convMeta.lastModifiedTime,
+        pricingCatalog.source,
+        pricingCatalog.fetchedAt,
+        children.length,
+      ].join('|')
+    : '';
+  const isIdleUnchanged =
+    !force &&
+    existing?.data &&
+    !existing.error &&
+    convMeta?.status === 'CASCADE_RUN_STATUS_IDLE' &&
+    fingerprint &&
+    existing.fingerprint === fingerprint &&
+    (existing.data.session?.turnsCount === 0 || existing.data.context?.groups?.length > 0) &&
+    now - existing.fetchedAt < IDLE_CACHE_MAX_MS;
+  if (isIdleUnchanged) {
+    return existing.data;
+  }
+
   if (cache.inFlight.has(convId)) return cache.inFlight.get(convId);
 
   const task = (async () => {
     try {
-      const convMeta = cache.conversations.find((c) => c.id === convId);
       const data = await fetchTelemetry(convId, {
         stepCount: force ? null : (convMeta?.stepCount ?? null),
-        extraChildren: cache.childrenByRoot.get(convId) || [],
+        extraChildren: children,
         trajCache: cache.trajByConv,
         subCache: cache.subByConv,
         pricingMap: pricingCatalog.map,
@@ -109,13 +136,14 @@ async function refreshTelemetry(convId, force = false) {
           data.context.heavyConsumers = lastBreakdown.heavyConsumers;
         }
       }
-      setTelemetryCache(convId, { data, fetchedAt: Date.now(), error: null });
+      setTelemetryCache(convId, { data, fetchedAt: Date.now(), error: null, fingerprint });
       return data;
     } catch (err) {
       setTelemetryCache(convId, {
         data: existing?.data || null,
         fetchedAt: Date.now(),
         error: err.message,
+        fingerprint: existing?.fingerprint || '',
       });
       return existing?.data || null;
     } finally {

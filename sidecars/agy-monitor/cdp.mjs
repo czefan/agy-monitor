@@ -5,7 +5,9 @@ import { UUID_RE } from './telemetry.mjs';
 
 const CDP_LOCK_FILE = join(process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR || tmpdir(), 'agy-monitor-cdp.lock.json');
 const CDP_LEASE_TTL_MS = 10_000;
+const CDP_LEASE_RENEW_MS = 4_000;
 const INSTANCE_STARTED_AT = Date.now();
+const CAPSULE_VERSION = 2;
 
 function isPidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
@@ -23,8 +25,9 @@ function isPidAlive(pid) {
 function acquireCdpLease() {
   const now = Date.now();
   try {
+    let cur = null;
     if (existsSync(CDP_LOCK_FILE)) {
-      const cur = JSON.parse(readFileSync(CDP_LOCK_FILE, 'utf-8'));
+      cur = JSON.parse(readFileSync(CDP_LOCK_FILE, 'utf-8'));
       const fresh = cur && Number(cur.ts) > now - CDP_LEASE_TTL_MS;
       const otherPid = Number(cur?.pid);
       if (fresh && otherPid && otherPid !== process.pid && isPidAlive(otherPid)) {
@@ -34,6 +37,9 @@ function acquireCdpLease() {
           return false;
         }
       }
+    }
+    if (cur && Number(cur.pid) === process.pid && Number(cur.ts) > now - CDP_LEASE_RENEW_MS) {
+      return true;
     }
     mkdirSync(dirname(CDP_LOCK_FILE), { recursive: true });
     writeFileSync(
@@ -96,12 +102,23 @@ export function readDevToolsActivePort() {
   return null;
 }
 
+const CAPSULE_PROBE = `(() => {
+  const m = window.__agyMonitor;
+  if (!m || (m.version || 0) < ${CAPSULE_VERSION}) return { inject: true };
+  return {
+    inject: false,
+    mounted: Boolean(document.getElementById('agy-monitor-capsule-root')?.isConnected),
+    convId: m.getConvId(),
+    stale: (m.version || 0) > ${CAPSULE_VERSION},
+  };
+})()`;
+
 /**
  * Pure-DOM (zero innerHTML, Trusted-Types safe) composer-bar capsule payload.
  * Runs inside the Electron renderer via Runtime.evaluate.
  */
 const CAPSULE_SCRIPT = `(() => {
-  const VERSION = 2;
+  const VERSION = ${CAPSULE_VERSION};
   const curVer = window.__agyMonitor?.version || 0;
   if (curVer >= VERSION) {
     return {
@@ -541,8 +558,12 @@ export class CapsuleManager {
           this.clients.set(target.id, client);
         }
         try {
-          const evalRes = await client.evaluate(CAPSULE_SCRIPT);
-          const meta = evalRes?.result?.value || {};
+          let evalRes = await client.evaluate(CAPSULE_PROBE);
+          let meta = evalRes?.result?.value || {};
+          if (meta.inject) {
+            evalRes = await client.evaluate(CAPSULE_SCRIPT);
+            meta = evalRes?.result?.value || {};
+          }
           if (meta.stale) continue;
           const convId = UUID_RE.test(meta.convId) ? meta.convId : fallbackConvId;
           if (convId) {
