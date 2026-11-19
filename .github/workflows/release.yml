@@ -1,0 +1,54 @@
+name: Release Plugin Package
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag / version label (e.g. v0.1.0)'
+        required: true
+        default: 'v0.1.0'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Run checks and tests
+        run: |
+          node --check sidecars/agy-monitor/main.mjs
+          node --check sidecars/agy-monitor/telemetry.mjs
+          node --check sidecars/agy-monitor/pricing.mjs
+          node --check sidecars/agy-monitor/cdp.mjs
+          node --check sidecars/agy-monitor/app.js
+          node --test tests/telemetry.test.mjs
+      - name: Package plugin archive
+        id: pkg
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          fi
+          ARCHIVE="agy-monitor-${TAG}.zip"
+          mkdir -p dist/agy-monitor
+          cp plugin.json LICENSE dist/agy-monitor/
+          cp -r assets sidecars dist/agy-monitor/
+          node -e "const fs=require('fs');let s=fs.readFileSync('README.md','utf8');s=s.replace(/## 界面预览\r?\n[\s\S]*?---\r?\n\r?\n/,'').replace(/\r?\n---\r?\n\r?\n## 贡献与协议\r?\n[\s\S]*$/,'');fs.writeFileSync('dist/agy-monitor/README.md',s);"
+          (cd dist && zip -r "../${ARCHIVE}" agy-monitor)
+          echo "archive=${ARCHIVE}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.pkg.outputs.tag }}
+          files: ${{ steps.pkg.outputs.archive }}
+          generate_release_notes: true

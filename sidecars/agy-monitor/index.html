@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AGY Monitor</title>
+  <script src="/preload.js"></script>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="topbar-row">
+        <div class="brand">
+          <span class="brand-dot" id="status-dot"></span>
+          <h1 class="brand-title">AGY Monitor</h1>
+          <span class="badge" id="model-badge">--</span>
+        </div>
+        <div class="topbar-actions">
+          <button type="button" class="icon-btn" id="cdp-pill" title="查看输入框胶囊状态">胶囊: 检测中</button>
+          <button type="button" class="icon-btn" id="refresh-btn" title="立即刷新">刷新</button>
+        </div>
+      </div>
+
+      <div class="conv-row">
+        <select id="conv-select" class="conv-select" aria-label="选择会话"></select>
+        <span class="updated-at" id="updated-at">--</span>
+      </div>
+
+      <div id="cdp-hint" class="cdp-hint hidden">
+        未检测到桌面端调试端口（<code>DevToolsActivePort</code>），因此输入框迷你胶囊暂未挂载；右侧面板仍正常实时工作。若需开启输入框胶囊，请为 Antigravity 桌面快捷方式添加启动参数 <code>--remote-debugging-port=0</code> 并重启应用。
+      </div>
+    </header>
+
+    <main id="content" class="content">
+      <section class="card">
+        <div class="card-head">
+          <span class="card-title">上下文窗口</span>
+          <div class="head-badges">
+            <span class="compact-badge" id="ctx-compacts" data-level="ok">压缩 0 次</span>
+            <span class="level-badge" id="ctx-level" data-level="ok">正常</span>
+          </div>
+        </div>
+        <div class="ctx-headline">
+          <span class="ctx-pct" id="ctx-pct">0.0%</span>
+          <span class="ctx-nums" id="ctx-nums">0 / 0</span>
+        </div>
+        <div class="stacked-bar" id="ctx-bar" aria-label="上下文构成进度条"></div>
+        <div class="ctx-warn hidden" id="ctx-warn"></div>
+        <div class="breakdown-list" id="ctx-groups"></div>
+
+        <div class="subblock" id="heavy-block">
+          <div class="subblock-head">
+            <span class="subblock-title">膨胀定位（最大消耗步骤）</span>
+            <button type="button" class="link-btn" id="heavy-toggle">展开 Top 8</button>
+          </div>
+          <div class="table-wrap">
+            <table class="turns-table compact-table">
+              <thead>
+                <tr>
+                  <th>步</th>
+                  <th>来源</th>
+                  <th>Tokens</th>
+                  <th>占比</th>
+                </tr>
+              </thead>
+              <tbody id="heavy-body">
+                <tr><td colspan="4" class="empty-cell">暂无上下文步骤数据</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="kpi-grid">
+        <div class="card kpi">
+          <div class="kpi-label">本轮生成速度 (TPS)</div>
+          <div class="kpi-val" id="kpi-tps">--</div>
+          <div class="kpi-sub" id="kpi-tps-sub">会话均值 --</div>
+        </div>
+        <div class="card kpi">
+          <div class="kpi-label">本轮首字延迟 (TTFT)</div>
+          <div class="kpi-val" id="kpi-ttft">--</div>
+          <div class="kpi-sub" id="kpi-ttft-sub">会话中位数 --</div>
+        </div>
+        <div class="card kpi">
+          <div class="kpi-label">累计新增输入</div>
+          <div class="kpi-val" id="kpi-in">--</div>
+          <div class="kpi-sub" id="kpi-in-sub">本轮 --</div>
+        </div>
+        <div class="card kpi">
+          <div class="kpi-label">会话缓存命中率</div>
+          <div class="kpi-val" id="kpi-cache">--</div>
+          <div class="kpi-sub" id="kpi-cache-sub">本轮 --</div>
+        </div>
+        <div class="card kpi">
+          <div class="kpi-label">累计输出 Tokens</div>
+          <div class="kpi-val" id="kpi-out">--</div>
+          <div class="kpi-sub" id="kpi-out-sub">本轮 -- · 思考 --</div>
+        </div>
+        <div class="card kpi">
+          <div class="kpi-label">累计 API 费用</div>
+          <div class="kpi-val" id="kpi-cost">--</div>
+          <div class="kpi-sub" id="kpi-cost-sub">models.dev 官方费率</div>
+        </div>
+      </section>
+
+      <section class="card sub-card">
+        <div class="card-head sub-head">
+          <span class="card-title">子代理消耗</span>
+          <div class="head-badges">
+            <span class="muted" id="sub-summary">0 个子代理</span>
+            <button type="button" class="link-btn hidden" id="sub-toggle">展开</button>
+          </div>
+        </div>
+        <div class="table-wrap sub-wrap hidden" id="sub-wrap">
+          <table class="turns-table">
+            <thead>
+              <tr>
+                <th>角色 / 类型</th>
+                <th>模型</th>
+                <th>轮次</th>
+                <th>新输入</th>
+                <th>缓存</th>
+                <th>输出</th>
+                <th>TPS</th>
+              </tr>
+            </thead>
+            <tbody id="sub-body">
+              <tr><td colspan="7" class="empty-cell">当前对话未调用子代理</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <span class="card-title">最近调用轮次</span>
+          <span class="muted" id="turns-count">0 轮</span>
+        </div>
+        <div class="table-wrap">
+          <table class="turns-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>模型</th>
+                <th>TPS</th>
+                <th>TTFT</th>
+                <th>新输入</th>
+                <th>输出 (思考)</th>
+                <th>缓存</th>
+                <th>费用</th>
+                <th>上下文</th>
+              </tr>
+            </thead>
+            <tbody id="turns-body">
+              <tr><td colspan="9" class="empty-cell">等待数据…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>

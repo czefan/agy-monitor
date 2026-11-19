@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.log
+*.zip
+pricing-cache.json
+.env
+.DS_Store
+Thumbs.db
