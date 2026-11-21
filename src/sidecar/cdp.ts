@@ -1,39 +1,82 @@
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { UUID_RE } from './telemetry.mjs';
+import type { CapsulePayload, CdpStatus, TelemetryReport } from '../shared/types.js';
+import { UUID_RE } from './telemetry.js';
 
-const CDP_LOCK_FILE = join(process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR || tmpdir(), 'agy-monitor-cdp.lock.json');
+const CDP_LOCK_FILE = join(
+  process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR || tmpdir(),
+  'agy-monitor-cdp.lock.json',
+);
 const CDP_LEASE_TTL_MS = 10_000;
 const CDP_LEASE_RENEW_MS = 4_000;
 const INSTANCE_STARTED_AT = Date.now();
 const CAPSULE_VERSION = 2;
 
-function isPidAlive(pid) {
+interface CdpLockRecord {
+  pid?: number;
+  startedAt?: number;
+  ts?: number;
+}
+
+interface DevToolsPortInfo {
+  port: number;
+  browserPath: string;
+  file: string;
+}
+
+interface CdpTarget {
+  id: string;
+  type?: string;
+  url?: string;
+  webSocketDebuggerUrl?: string;
+}
+
+interface CdpPendingEntry {
+  resolve: (value: unknown) => void;
+  reject: (err: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+interface CdpEvaluateResult {
+  result?: {
+    value?: {
+      inject?: boolean;
+      mounted?: boolean;
+      convId?: string;
+      stale?: boolean;
+    };
+  };
+}
+
+function isPidAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
     return true;
   } catch (err) {
-    return err?.code === 'EPERM';
+    return (err as NodeJS.ErrnoException)?.code === 'EPERM';
   }
 }
 
 /**
  * Coordinate CDP ownership across sidecar processes so only one instance writes to the UI.
  */
-function acquireCdpLease() {
+function acquireCdpLease(): boolean {
   const now = Date.now();
   try {
-    let cur = null;
+    let cur: CdpLockRecord | null = null;
     if (existsSync(CDP_LOCK_FILE)) {
-      cur = JSON.parse(readFileSync(CDP_LOCK_FILE, 'utf-8'));
-      const fresh = cur && Number(cur.ts) > now - CDP_LEASE_TTL_MS;
+      cur = JSON.parse(readFileSync(CDP_LOCK_FILE, 'utf-8')) as CdpLockRecord;
+      const fresh = Boolean(cur && Number(cur.ts) > now - CDP_LEASE_TTL_MS);
       const otherPid = Number(cur?.pid);
       if (fresh && otherPid && otherPid !== process.pid && isPidAlive(otherPid)) {
         // Yield to a newer sidecar process or the current active lease holder.
         const otherStarted = Number(cur.startedAt || 0);
-        if (otherStarted > INSTANCE_STARTED_AT || (otherStarted === INSTANCE_STARTED_AT && otherPid > process.pid)) {
+        if (
+          otherStarted > INSTANCE_STARTED_AT ||
+          (otherStarted === INSTANCE_STARTED_AT && otherPid > process.pid)
+        ) {
           return false;
         }
       }
@@ -52,22 +95,18 @@ function acquireCdpLease() {
   }
 }
 
-function releaseCdpLease() {
+function releaseCdpLease(): void {
   try {
     if (!existsSync(CDP_LOCK_FILE)) return;
-    const cur = JSON.parse(readFileSync(CDP_LOCK_FILE, 'utf-8'));
+    const cur = JSON.parse(readFileSync(CDP_LOCK_FILE, 'utf-8')) as CdpLockRecord;
     if (Number(cur?.pid) === process.pid) unlinkSync(CDP_LOCK_FILE);
   } catch {
     // Ignore cleanup errors on exit.
   }
 }
 
-/**
- * Candidate DevToolsActivePort file locations for Antigravity Desktop across OSes.
- * @returns {string[]}
- */
-function getDevToolsPortPaths() {
-  const paths = [];
+function getDevToolsPortPaths(): string[] {
+  const paths: string[] = [];
   if (process.env.APPDATA) {
     paths.push(join(process.env.APPDATA, 'Antigravity', 'DevToolsActivePort'));
   }
@@ -79,11 +118,7 @@ function getDevToolsPortPaths() {
   return paths;
 }
 
-/**
- * Read active CDP port from Antigravity's DevToolsActivePort file if present.
- * @returns {{port: number, browserPath: string, file: string}|null}
- */
-export function readDevToolsActivePort() {
+export function readDevToolsActivePort(): DevToolsPortInfo | null {
   for (const file of getDevToolsPortPaths()) {
     if (!existsSync(file)) continue;
     try {
@@ -91,7 +126,7 @@ export function readDevToolsActivePort() {
         .split(/\r?\n/)
         .map((l) => l.trim())
         .filter(Boolean);
-      const port = Number.parseInt(lines[0], 10);
+      const port = Number.parseInt(lines[0] ?? '', 10);
       if (Number.isFinite(port) && port > 0 && port < 65536) {
         return { port, browserPath: lines[1] || '', file };
       }
@@ -377,23 +412,22 @@ const CAPSULE_SCRIPT = `(() => {
   return { mounted: Boolean(root?.isConnected), convId: getConvId() };
 })();`;
 
-/**
- * Minimal CDP WebSocket client using Node's built-in WebSocket.
- */
 class CdpClient {
-  constructor(wsUrl) {
+  readonly wsUrl: string;
+  private ws: WebSocket | null = null;
+  private connecting: Promise<void> | null = null;
+  private nextId = 1;
+  private pending = new Map<number, CdpPendingEntry>();
+
+  constructor(wsUrl: string) {
     this.wsUrl = wsUrl;
-    this.ws = null;
-    this.connecting = null;
-    this.nextId = 1;
-    this.pending = new Map();
   }
 
-  async connect() {
+  async connect(): Promise<void> {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) return;
     if (this.connecting) return this.connecting;
 
-    this.connecting = new Promise((resolve, reject) => {
+    this.connecting = new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(this.wsUrl);
       const timer = setTimeout(() => {
         ws.close();
@@ -418,13 +452,19 @@ class CdpClient {
       });
       ws.addEventListener('message', (event) => {
         try {
-          const msg = JSON.parse(String(event.data));
+          const msg = JSON.parse(String(event.data)) as {
+            id?: number;
+            error?: { message?: string };
+            result?: unknown;
+          };
           if (msg.id && this.pending.has(msg.id)) {
             const entry = this.pending.get(msg.id);
             this.pending.delete(msg.id);
-            clearTimeout(entry.timer);
-            if (msg.error) entry.reject(new Error(msg.error.message || 'CDP error'));
-            else entry.resolve(msg.result);
+            if (entry) {
+              clearTimeout(entry.timer);
+              if (msg.error) entry.reject(new Error(msg.error.message || 'CDP error'));
+              else entry.resolve(msg.result);
+            }
           }
         } catch {
           // Ignore malformed CDP message.
@@ -437,20 +477,34 @@ class CdpClient {
     return this.connecting;
   }
 
-  async evaluate(expression) {
+  async evaluate<T = unknown>(expression: string): Promise<T> {
     await this.connect();
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      throw new Error('CDP WebSocket not open');
+    }
     const id = this.nextId++;
-    return new Promise((resolve, reject) => {
+    return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error('CDP evaluate timeout'));
       }, 3000);
-      this.pending.set(id, { resolve, reject, timer });
-      this.ws.send(JSON.stringify({ id, method: 'Runtime.evaluate', params: { expression, returnByValue: true } }));
+      this.pending.set(id, {
+        resolve: resolve as (value: unknown) => void,
+        reject,
+        timer,
+      });
+      ws.send(
+        JSON.stringify({
+          id,
+          method: 'Runtime.evaluate',
+          params: { expression, returnByValue: true },
+        }),
+      );
     });
   }
 
-  close() {
+  close(): void {
     try {
       this.ws?.close();
     } catch {
@@ -460,11 +514,7 @@ class CdpClient {
   }
 }
 
-/**
- * Extract only the scalar fields consumed by the composer capsule.
- * @param {object} payload
- */
-function buildCapsulePayload(payload) {
+function buildCapsulePayload(payload: TelemetryReport): CapsulePayload {
   return {
     context: {
       used: payload?.context?.used || 0,
@@ -490,18 +540,25 @@ function buildCapsulePayload(payload) {
  * Manages optional CDP composer-bar capsule attachment without modifying app.asar.
  */
 export class CapsuleManager {
-  constructor(getTelemetryForConv) {
+  private readonly getTelemetryForConv: (convId: string) => Promise<TelemetryReport | null>;
+  private readonly clients = new Map<string, CdpClient>();
+  private readonly lastPushedByTarget = new Map<string, string>();
+  private lastPortCheckAt = 0;
+  status: CdpStatus = { state: 'checking', port: null, targets: 0, detail: 'Initializing' };
+
+  constructor(getTelemetryForConv: (convId: string) => Promise<TelemetryReport | null>) {
     this.getTelemetryForConv = getTelemetryForConv;
-    this.clients = new Map();
-    this.lastPushedByTarget = new Map();
-    this.lastPortCheckAt = 0;
-    this.status = { state: 'checking', port: null, targets: 0, detail: 'Initializing' };
   }
 
-  async tick(fallbackConvId) {
+  async tick(fallbackConvId: string): Promise<CdpStatus> {
     if (!acquireCdpLease()) {
       this.closeAll();
-      this.status = { state: 'standby', port: null, targets: 0, detail: 'Handled by active sidecar instance' };
+      this.status = {
+        state: 'standby',
+        port: null,
+        targets: 0,
+        detail: 'Handled by active sidecar instance',
+      };
       return this.status;
     }
 
@@ -527,17 +584,23 @@ export class CapsuleManager {
         signal: AbortSignal.timeout(2000),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const targets = (await res.json()).filter(
-        (t) =>
+      const rawTargets = (await res.json()) as CdpTarget[];
+      const targets = rawTargets.filter(
+        (t): t is CdpTarget & { webSocketDebuggerUrl: string } =>
           t.type === 'page' &&
-          t.webSocketDebuggerUrl &&
+          Boolean(t.webSocketDebuggerUrl) &&
           !String(t.url || '').startsWith('devtools://') &&
           !String(t.url || '').startsWith('data:'),
       );
 
       if (!targets.length) {
         this.closeAll();
-        this.status = { state: 'no_target', port: portInfo.port, targets: 0, detail: 'No Antigravity page target' };
+        this.status = {
+          state: 'no_target',
+          port: portInfo.port,
+          targets: 0,
+          detail: 'No Antigravity page target',
+        };
         return this.status;
       }
 
@@ -558,14 +621,14 @@ export class CapsuleManager {
           this.clients.set(target.id, client);
         }
         try {
-          let evalRes = await client.evaluate(CAPSULE_PROBE);
+          let evalRes = await client.evaluate<CdpEvaluateResult>(CAPSULE_PROBE);
           let meta = evalRes?.result?.value || {};
           if (meta.inject) {
-            evalRes = await client.evaluate(CAPSULE_SCRIPT);
+            evalRes = await client.evaluate<CdpEvaluateResult>(CAPSULE_SCRIPT);
             meta = evalRes?.result?.value || {};
           }
           if (meta.stale) continue;
-          const convId = UUID_RE.test(meta.convId) ? meta.convId : fallbackConvId;
+          const convId = meta.convId && UUID_RE.test(meta.convId) ? meta.convId : fallbackConvId;
           if (convId) {
             const payload = await this.getTelemetryForConv(convId);
             if (payload) {
@@ -593,12 +656,17 @@ export class CapsuleManager {
       return this.status;
     } catch (err) {
       this.closeAll();
-      this.status = { state: 'error', port: portInfo.port, targets: 0, detail: err.message };
+      this.status = {
+        state: 'error',
+        port: portInfo.port,
+        targets: 0,
+        detail: err instanceof Error ? err.message : String(err),
+      };
       return this.status;
     }
   }
 
-  closeAll(releaseLease = false) {
+  closeAll(releaseLease = false): void {
     for (const client of this.clients.values()) client.close();
     this.clients.clear();
     this.lastPushedByTarget.clear();

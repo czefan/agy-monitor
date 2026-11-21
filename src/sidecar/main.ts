@@ -3,15 +3,26 @@ import { createConnection } from 'node:net';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Response, SidecarApp } from 'sidecar_sdk';
-import { CapsuleManager } from './cdp.mjs';
-import { PricingCatalog } from './pricing.mjs';
-import { fetchConversations, fetchTelemetry, UUID_RE } from './telemetry.mjs';
+import type {
+  ContextGroupItem,
+  ConversationSummary,
+  HeavyConsumerItem,
+  TelemetryApiResponse,
+  TelemetryReport,
+} from '../shared/types.js';
+import { CapsuleManager } from './cdp.js';
+import { PricingCatalog } from './pricing.js';
+import {
+  fetchConversations,
+  fetchTelemetry,
+  UUID_RE,
+  type CachedSubagentEntry,
+  type CachedTrajectoryEntry,
+  type SubagentRef,
+} from './telemetry.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const STATIC = {
-  '/styles.css': ['styles.css', 'text/css'],
-  '/app.js': ['app.js', 'application/javascript'],
-};
+const WEB_ROOT = join(__dirname, '..', 'web');
 
 const POLL_INTERVAL_MS = 2000;
 const STALE_CACHE_MS = 1800;
@@ -19,22 +30,38 @@ const IDLE_CACHE_MAX_MS = 60_000;
 const ACTIVE_CLIENT_WINDOW_MS = 10_000;
 const MAX_CACHED_CONVS = 20;
 
+interface CachedTelemetryEntry {
+  data: TelemetryReport | null;
+  fetchedAt: number;
+  error: string | null;
+  fingerprint: string;
+}
+
+interface CachedBreakdownEntry {
+  groups: ContextGroupItem[];
+  heavyConsumers: HeavyConsumerItem[];
+}
+
 const app = new SidecarApp();
 const pricingCatalog = new PricingCatalog();
 
 const cache = {
-  conversations: [],
-  childrenByRoot: new Map(),
-  telemetryByConv: new Map(), // convId -> { data, fetchedAt, error, etag }
-  breakdownByConv: new Map(), // convId -> { groups, heavyConsumers }
-  trajByConv: new Map(),      // convId -> { stepCount, stats }
-  subByConv: new Map(),       // subConvId -> { report, pricingSource }
-  inFlight: new Map(),
+  conversations: [] as ConversationSummary[],
+  childrenByRoot: new Map<string, SubagentRef[]>(),
+  telemetryByConv: new Map<string, CachedTelemetryEntry>(),
+  breakdownByConv: new Map<string, CachedBreakdownEntry>(),
+  trajByConv: new Map<string, CachedTrajectoryEntry>(),
+  subByConv: new Map<string, CachedSubagentEntry>(),
+  inFlight: new Map<string, Promise<TelemetryReport | null>>(),
   lastConvFetchAt: 0,
   lastUiPollAt: 0,
 };
 
-function computeTelemetryEtag(convId, data, cdpState) {
+function computeTelemetryEtag(
+  convId: string,
+  data: TelemetryReport | null | undefined,
+  cdpState: string,
+): string {
   if (!data) return `${convId}|none|${cdpState}`;
   return [
     convId,
@@ -51,16 +78,16 @@ function computeTelemetryEtag(convId, data, cdpState) {
   ].join('|');
 }
 
-function setTelemetryCache(convId, value) {
+function setTelemetryCache(convId: string, value: CachedTelemetryEntry): void {
   cache.telemetryByConv.delete(convId);
   cache.telemetryByConv.set(convId, value);
   while (cache.telemetryByConv.size > MAX_CACHED_CONVS) {
     const oldestKey = cache.telemetryByConv.keys().next().value;
-    cache.telemetryByConv.delete(oldestKey);
+    if (oldestKey !== undefined) cache.telemetryByConv.delete(oldestKey);
   }
 }
 
-async function refreshConversations(force = false) {
+async function refreshConversations(force = false): Promise<ConversationSummary[]> {
   const now = Date.now();
   if (!force && now - cache.lastConvFetchAt < STALE_CACHE_MS && cache.conversations.length) {
     return cache.conversations;
@@ -76,7 +103,7 @@ async function refreshConversations(force = false) {
   return cache.conversations;
 }
 
-async function refreshTelemetry(convId, force = false) {
+async function refreshTelemetry(convId: string, force = false): Promise<TelemetryReport | null> {
   if (!convId || !UUID_RE.test(convId)) return null;
   const now = Date.now();
   const existing = cache.telemetryByConv.get(convId);
@@ -109,9 +136,10 @@ async function refreshTelemetry(convId, force = false) {
     return existing.data;
   }
 
-  if (cache.inFlight.has(convId)) return cache.inFlight.get(convId);
+  const inflight = cache.inFlight.get(convId);
+  if (inflight) return inflight;
 
-  const task = (async () => {
+  const task = (async (): Promise<TelemetryReport | null> => {
     try {
       const data = await fetchTelemetry(convId, {
         stepCount: force ? null : (convMeta?.stepCount ?? null),
@@ -127,7 +155,8 @@ async function refreshTelemetry(convId, force = false) {
           heavyConsumers: data.context.heavyConsumers || [],
         });
         while (cache.breakdownByConv.size > MAX_CACHED_CONVS) {
-          cache.breakdownByConv.delete(cache.breakdownByConv.keys().next().value);
+          const oldestKey = cache.breakdownByConv.keys().next().value;
+          if (oldestKey !== undefined) cache.breakdownByConv.delete(oldestKey);
         }
       } else if (data?.context) {
         const lastBreakdown = cache.breakdownByConv.get(convId);
@@ -142,7 +171,7 @@ async function refreshTelemetry(convId, force = false) {
       setTelemetryCache(convId, {
         data: existing?.data || null,
         fetchedAt: Date.now(),
-        error: err.message,
+        error: err instanceof Error ? err.message : String(err),
         fingerprint: existing?.fingerprint || '',
       });
       return existing?.data || null;
@@ -157,12 +186,13 @@ async function refreshTelemetry(convId, force = false) {
 
 const cdpManager = new CapsuleManager((convId) => refreshTelemetry(convId));
 
-function pickActiveConversation(requestedConvId) {
+function pickActiveConversation(requestedConvId?: string): string {
   if (requestedConvId && UUID_RE.test(requestedConvId)) return requestedConvId;
-  if (app.config?.conversationId && UUID_RE.test(app.config.conversationId)) return app.config.conversationId;
-  if (process.env.ANTIGRAVITY_CONVERSATION_ID && UUID_RE.test(process.env.ANTIGRAVITY_CONVERSATION_ID)) {
-    return process.env.ANTIGRAVITY_CONVERSATION_ID;
+  if (app.config?.conversationId && UUID_RE.test(app.config.conversationId)) {
+    return app.config.conversationId;
   }
+  const envConv = process.env.ANTIGRAVITY_CONVERSATION_ID;
+  if (envConv && UUID_RE.test(envConv)) return envConv;
   const topMain = cache.conversations.find((c) => !c.isChild);
   return topMain?.id || cache.conversations[0]?.id || '';
 }
@@ -170,7 +200,7 @@ function pickActiveConversation(requestedConvId) {
 let ticking = false;
 let lsMissCount = 0;
 
-function parseAssignedLsEndpoint() {
+function parseAssignedLsEndpoint(): { host: string; port: number } | null {
   const raw = (process.env.ANTIGRAVITY_LS_ADDRESS || '').trim();
   if (!raw) return null;
   try {
@@ -183,10 +213,10 @@ function parseAssignedLsEndpoint() {
   }
 }
 
-function probeTcp(host, port) {
+function probeTcp(host: string, port: number): Promise<boolean> {
   return new Promise((resolve) => {
     const sock = createConnection({ host, port });
-    const done = (ok) => {
+    const done = (ok: boolean): void => {
       sock.destroy();
       resolve(ok);
     };
@@ -198,7 +228,7 @@ function probeTcp(host, port) {
 
 const assignedLs = parseAssignedLsEndpoint();
 
-async function backgroundTick(isInitial = false) {
+async function backgroundTick(isInitial = false): Promise<void> {
   if (ticking) return;
   ticking = true;
   try {
@@ -226,13 +256,24 @@ async function backgroundTick(isInitial = false) {
   }
 }
 
-app.page('/', () => readFileSync(join(__dirname, 'index.html'), 'utf-8'));
+app.page('/', () => readFileSync(join(WEB_ROOT, 'index.html'), 'utf-8'));
 
-for (const [route, [file, contentType]] of Object.entries(STATIC)) {
-  app.api(route, () => new Response(readFileSync(join(__dirname, file), 'utf-8'), { contentType }), 'GET');
-}
+app.api(
+  '/styles.css',
+  () => new Response(readFileSync(join(WEB_ROOT, 'styles.css'), 'utf-8'), { contentType: 'text/css' }),
+  'GET',
+);
 
-app.api('/api/telemetry', async (data) => {
+app.api(
+  '/app.js',
+  () =>
+    new Response(readFileSync(join(WEB_ROOT, 'app.js'), 'utf-8'), {
+      contentType: 'application/javascript',
+    }),
+  'GET',
+);
+
+app.api('/api/telemetry', async (data): Promise<TelemetryApiResponse> => {
   cache.lastUiPollAt = Date.now();
   let convId = pickActiveConversation(data?.conversationId);
   const force = data?.refresh === '1' || data?.refresh === 'true';
@@ -278,7 +319,7 @@ void backgroundTick(true);
 const timer = setInterval(() => void backgroundTick(), POLL_INTERVAL_MS);
 timer.unref?.();
 
-function shutdown() {
+function shutdown(): void {
   clearInterval(timer);
   cdpManager.closeAll(true);
   process.exit(0);
@@ -287,4 +328,4 @@ function shutdown() {
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
-app.run();
+void app.run();

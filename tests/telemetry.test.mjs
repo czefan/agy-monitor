@@ -5,7 +5,7 @@ import {
   computeTurnCostUsd,
   normalizeModelKey,
   resolveModelPrice,
-} from '../sidecars/agy-monitor/pricing.mjs';
+} from '../dist/sidecars/agy-monitor/sidecar/pricing.js';
 import {
   buildSubagentSummary,
   buildTelemetryReport,
@@ -15,7 +15,7 @@ import {
   getContextLevel,
   median,
   parseDurationSeconds,
-} from '../sidecars/agy-monitor/telemetry.mjs';
+} from '../dist/sidecars/agy-monitor/sidecar/telemetry.js';
 
 test('parseDurationSeconds parses protobuf seconds strings and numbers', () => {
   assert.equal(parseDurationSeconds('12.981315700s'), 12.9813157);
@@ -104,11 +104,13 @@ test('buildTelemetryReport computes context, weighted TPS, median TTFT, and cach
   assert.ok(Math.abs(report.context.pct - (420000 / 512000) * 100) < 1e-9);
   assert.equal(report.context.level, 'warn');
 
+  assert.ok(report.latest);
   assert.equal(report.latest.tps, 150);
   assert.equal(report.latest.ttftSec, 8);
   assert.equal(report.latest.cacheHitPct, 90);
 
   // Weighted average TPS: (200 + 600) / (2.0 + 4.0) = 800 / 6
+  assert.ok(report.session.avgTps !== null);
   assert.ok(Math.abs(report.session.avgTps - 800 / 6) < 1e-9);
   assert.equal(report.session.medianTtftSec, 6);
   assert.equal(report.session.cacheHitPct, 90);
@@ -128,6 +130,7 @@ test('buildTelemetryReport skips TPS on sub-50ms single-burst flushes', () => {
       },
     },
   ]);
+  assert.ok(report.latest);
   assert.equal(report.latest.tps, null);
   assert.equal(report.session.avgTps, null);
   assert.equal(report.session.totalOutputTokens, 200);
@@ -223,36 +226,91 @@ test('extractHeavyConsumers ranks top chat steps and resolves step descriptions'
   assert.equal(top[0].label, '读取 large.json');
   assert.equal(top[0].pct, 12);
   assert.equal(top[1].label, '命令 pnpm test');
-  assert.equal(describeStep({ codeAction: { actionSpec: { createFile: { path: { absoluteUri: 'file:///d:/a.js' } } } } }), '编辑 a.js');
+  assert.equal(
+    describeStep({
+      codeAction: { actionSpec: { createFile: { path: { absoluteUri: 'file:///d:/a.js' } } } },
+    }),
+    '编辑 a.js',
+  );
   assert.equal(describeStep(undefined, 'GENERIC'), 'GENERIC');
 });
 
 test('buildSubagentSummary totals input, cache, and output tokens across subagents', () => {
   const summary = buildSubagentSummary([
     {
-      ref: { conversationId: 'sub-1', role: 'Auditor', typeName: 'research' },
+      ref: { conversationId: 'sub-1', role: 'Auditor', typeName: 'research', status: 'DONE' },
       report: {
         model: 'Gemini 4 Flash',
+        pricingSource: 'models.dev',
+        context: {
+          used: 0,
+          limit: 0,
+          pct: 0,
+          level: 'ok',
+          checkpointCount: 0,
+          groups: [],
+          heavyConsumers: [],
+        },
+        latest: null,
         session: {
           turnsCount: 4,
+          avgTps: 180,
+          medianTtftSec: null,
           totalInputTokens: 1000,
           totalCacheReadTokens: 8000,
           totalOutputTokens: 500,
-          avgTps: 180,
+          totalThinkingTokens: 0,
+          totalResponseTokens: 0,
+          cacheHitPct: null,
+          totalCostUsd: null,
+          totalCacheSavedUsd: null,
         },
+        subagents: {
+          count: 0,
+          totalInputTokens: 0,
+          totalCacheReadTokens: 0,
+          totalOutputTokens: 0,
+          items: [],
+        },
+        turns: [],
       },
     },
     {
-      ref: { conversationId: 'sub-2', role: 'Tester', typeName: 'self' },
+      ref: { conversationId: 'sub-2', role: 'Tester', typeName: 'self', status: 'DONE' },
       report: {
         model: 'Gemini 4 Hydrogen (High)',
+        pricingSource: 'models.dev',
+        context: {
+          used: 0,
+          limit: 0,
+          pct: 0,
+          level: 'ok',
+          checkpointCount: 0,
+          groups: [],
+          heavyConsumers: [],
+        },
+        latest: null,
         session: {
           turnsCount: 2,
+          avgTps: 220,
+          medianTtftSec: null,
           totalInputTokens: 500,
           totalCacheReadTokens: 2000,
           totalOutputTokens: 300,
-          avgTps: 220,
+          totalThinkingTokens: 0,
+          totalResponseTokens: 0,
+          cacheHitPct: null,
+          totalCostUsd: null,
+          totalCacheSavedUsd: null,
         },
+        subagents: {
+          count: 0,
+          totalInputTokens: 0,
+          totalCacheReadTokens: 0,
+          totalOutputTokens: 0,
+          items: [],
+        },
+        turns: [],
       },
     },
   ]);
@@ -272,13 +330,22 @@ test('pricing helpers normalize model slugs, prefer first-party rates, and calcu
   const map = buildModelsDevPricingMap({
     openrouter: {
       models: {
-        'google/gemini-3.8-flash': { name: 'Gemini 3.8 Flash', cost: { input: 0.825, output: 4.125, cache_read: 0.0825 } },
+        'google/gemini-3.8-flash': {
+          name: 'Gemini 3.8 Flash',
+          cost: { input: 0.825, output: 4.125, cache_read: 0.0825 },
+        },
       },
     },
     google: {
       models: {
-        'gemini-3.8-flash': { name: 'Gemini 3.8 Flash', cost: { input: 0.75, output: 3.75, cache_read: 0.075 } },
-        'gemini-4-hydrogen': { name: 'Gemini 4 Hydrogen', cost: { input: 1.5, output: 7.5, cache_read: 0.075 } },
+        'gemini-3.8-flash': {
+          name: 'Gemini 3.8 Flash',
+          cost: { input: 0.75, output: 3.75, cache_read: 0.075 },
+        },
+        'gemini-4-hydrogen': {
+          name: 'Gemini 4 Hydrogen',
+          cost: { input: 1.5, output: 7.5, cache_read: 0.075 },
+        },
       },
     },
   });
@@ -291,6 +358,11 @@ test('pricing helpers normalize model slugs, prefer first-party rates, and calcu
   assert.ok(Math.abs(flashRate.cacheRead - 0.075e-6) < 1e-12);
 
   const hydroRate = resolveModelPrice(map, 'gemini-4-hydrogen', 'Gemini 4 Hydrogen (High)');
-  const cost = computeTurnCostUsd({ inputTokens: 10000, cacheReadTokens: 100000, outputTokens: 2000 }, hydroRate);
+  assert.ok(hydroRate);
+  const cost = computeTurnCostUsd(
+    { inputTokens: 10000, cacheReadTokens: 100000, outputTokens: 2000 },
+    hydroRate,
+  );
+  assert.ok(cost !== null);
   assert.ok(Math.abs(cost - (0.015 + 0.0075 + 0.015)) < 1e-12);
 });

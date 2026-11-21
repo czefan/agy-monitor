@@ -1,7 +1,17 @@
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
-import { computeTurnCostUsd, resolveModelPrice } from './pricing.mjs';
+import type {
+  ContextGroupItem,
+  ContextLevel,
+  ConversationSummary,
+  HeavyConsumerItem,
+  SubagentItem,
+  SubagentSummary,
+  TelemetryReport,
+  TurnSummary,
+} from '../shared/types.js';
+import { computeTurnCostUsd, resolveModelPrice, type ModelPriceRate } from './pricing.js';
 
 export const WARN_THRESHOLD_PCT = 80;
 export const DANGER_THRESHOLD_PCT = 95;
@@ -9,16 +19,123 @@ export const MIN_STREAM_DURATION_SEC = 0.05;
 export const RECENT_TURNS_LIMIT = 20;
 export const UUID_RE = /^[0-9a-f-]{8,}$/i;
 
-let cachedEndpoints = null;
+export interface LsEndpoint {
+  address: string;
+  csrfToken: string;
+}
+
+export interface FilePathLike {
+  absoluteUri?: string;
+  fsPath?: string;
+  path?: string;
+  uri?: string;
+}
+
+export interface TrajectoryStep {
+  type?: string;
+  status?: string;
+  viewFile?: { absolutePathUri?: string | FilePathLike };
+  runCommand?: { commandLine?: string };
+  mcpTool?: { serverName?: string; toolName?: string };
+  codeAction?: {
+    actionSpec?: {
+      createFile?: { path?: string | FilePathLike };
+      editFile?: { path?: string | FilePathLike };
+      writeFile?: { path?: string | FilePathLike };
+    };
+  };
+  invokeSubagent?: {
+    subagents?: Array<{ role?: string; typeName?: string }>;
+    results?: Array<{ conversationId?: string }>;
+  };
+}
+
+export interface RawBreakdownChild {
+  name?: string;
+  numTokens?: number | string;
+}
+
+export interface RawBreakdownGroup {
+  name?: string;
+  type?: string;
+  numTokens?: number | string;
+  children?: RawBreakdownChild[];
+}
+
+export interface GeneratorMetadataEntry {
+  stepIndices?: number[];
+  chatModel?: {
+    modelDisplayName?: string;
+    responseModel?: string;
+    timeToFirstToken?: string | number;
+    streamingDuration?: string | number;
+    usage?: {
+      model?: string;
+      inputTokens?: number | string;
+      cacheReadTokens?: number | string;
+      outputTokens?: number | string;
+      thinkingOutputTokens?: number | string;
+      responseOutputTokens?: number | string;
+    };
+    chatStartMetadata?: {
+      contextWindowMetadata?: {
+        estimatedTokensUsed?: number | string;
+        maxContextTokens?: number | string;
+        tokenBreakdown?: {
+          groups?: RawBreakdownGroup[];
+        };
+      };
+    };
+  };
+}
+
+export interface SubagentRef {
+  conversationId: string;
+  role: string;
+  typeName: string;
+  status: string;
+}
+
+export interface TrajectoryStats {
+  checkpointCount: number;
+  stepLabels: string[];
+  subagentRefs: SubagentRef[];
+}
+
+export interface CachedTrajectoryEntry {
+  stepCount: number | null;
+  stats: TrajectoryStats;
+}
+
+export interface CachedSubagentEntry {
+  report: TelemetryReport;
+  pricingSource?: string;
+}
+
+export interface InternalGroup extends ContextGroupItem {
+  children: RawBreakdownChild[];
+}
+
+interface ParsedTurn extends TurnSummary {
+  responseModel: string;
+  groups: InternalGroup[];
+}
+
+interface TrajectorySummaryRaw {
+  summary?: string;
+  status?: string;
+  lastModifiedTime?: string;
+  stepCount?: number | string;
+  trajectoryMetadata?: {
+    rootConversationId?: string;
+  };
+}
+
+let cachedEndpoints: LsEndpoint[] | null = null;
 let endpointsCachedAt = 0;
 const ENDPOINTS_TTL_MS = 15_000;
 
-/**
- * Parse a Protobuf duration string like "12.981315700s" into seconds.
- * @param {string|number|null|undefined} raw
- * @returns {number|null}
- */
-export function parseDurationSeconds(raw) {
+export function parseDurationSeconds(raw: string | number | null | undefined): number | null {
   if (typeof raw === 'number') return Number.isFinite(raw) && raw >= 0 ? raw : null;
   if (typeof raw !== 'string') return null;
   const trimmed = raw.trim();
@@ -27,46 +144,27 @@ export function parseDurationSeconds(raw) {
   return Number.isFinite(val) && val >= 0 ? val : null;
 }
 
-/**
- * Convert numeric or string integer token counts safely.
- * @param {string|number|null|undefined} raw
- * @returns {number}
- */
-export function toInt(raw) {
+export function toInt(raw: string | number | null | undefined): number {
   const n = typeof raw === 'number' ? raw : Number.parseInt(String(raw ?? '0'), 10);
   return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
-/**
- * Compute median of finite numeric samples.
- * @param {number[]} values
- * @returns {number|null}
- */
-export function median(values) {
-  const valid = values.filter((v) => typeof v === 'number' && Number.isFinite(v)).sort((a, b) => a - b);
+export function median(values: number[]): number | null {
+  const valid = values
+    .filter((v) => typeof v === 'number' && Number.isFinite(v))
+    .sort((a, b) => a - b);
   if (!valid.length) return null;
   const mid = Math.floor(valid.length / 2);
   return valid.length % 2 === 1 ? valid[mid] : (valid[mid - 1] + valid[mid]) / 2;
 }
 
-/**
- * Determine context usage severity tier from percentage.
- * @param {number} pct
- * @returns {'ok'|'warn'|'danger'}
- */
-export function getContextLevel(pct) {
+export function getContextLevel(pct: number): ContextLevel {
   if (pct >= DANGER_THRESHOLD_PCT) return 'danger';
   if (pct >= WARN_THRESHOLD_PCT) return 'warn';
   return 'ok';
 }
 
-/**
- * Parse a single generatorMetadata entry into a normalized turn record.
- * @param {object} entry
- * @param {number} index
- * @returns {object|null}
- */
-function parseTurn(entry, index) {
+function parseTurn(entry: GeneratorMetadataEntry, index: number): ParsedTurn | null {
   const cm = entry?.chatModel;
   if (!cm || typeof cm !== 'object') return null;
 
@@ -81,14 +179,17 @@ function parseTurn(entry, index) {
 
   const ttftSec = parseDurationSeconds(cm.timeToFirstToken);
   const streamSec = parseDurationSeconds(cm.streamingDuration);
-  const tps = streamSec && streamSec >= MIN_STREAM_DURATION_SEC && outputTokens > 0 ? outputTokens / streamSec : null;
+  const tps =
+    streamSec && streamSec >= MIN_STREAM_DURATION_SEC && outputTokens > 0
+      ? outputTokens / streamSec
+      : null;
 
   const cwm = cm.chatStartMetadata?.contextWindowMetadata || {};
   const contextUsed = toInt(cwm.estimatedTokensUsed);
   const contextLimit = toInt(cwm.maxContextTokens);
   const contextPct = contextLimit > 0 ? (contextUsed / contextLimit) * 100 : 0;
 
-  const groups = Array.isArray(cwm.tokenBreakdown?.groups)
+  const groups: InternalGroup[] = Array.isArray(cwm.tokenBreakdown?.groups)
     ? cwm.tokenBreakdown.groups.map((g) => ({
         name: g.name || g.type || 'Other',
         type: g.type || '',
@@ -113,19 +214,14 @@ function parseTurn(entry, index) {
     contextUsed,
     contextLimit,
     contextPct,
+    costUsd: null,
     groups,
   };
 }
 
-/**
- * Safely extract the basename from a string path/URI or Protobuf file path object.
- * @param {string|object|null|undefined} raw
- * @returns {string}
- */
-function safeBasename(raw) {
-  const str = typeof raw === 'string'
-    ? raw
-    : (raw?.absoluteUri || raw?.fsPath || raw?.path || raw?.uri || '');
+function safeBasename(raw: string | FilePathLike | null | undefined): string {
+  const str =
+    typeof raw === 'string' ? raw : raw?.absoluteUri || raw?.fsPath || raw?.path || raw?.uri || '';
   if (typeof str !== 'string' || !str) return '';
   try {
     return basename(decodeURIComponent(str));
@@ -134,13 +230,10 @@ function safeBasename(raw) {
   }
 }
 
-/**
- * Build a concise human-readable label for a trajectory step.
- * @param {object|undefined} step
- * @param {string} fallbackType
- * @returns {string}
- */
-export function describeStep(step, fallbackType = '') {
+export function describeStep(
+  step: TrajectoryStep | string | undefined,
+  fallbackType = '',
+): string {
   if (typeof step === 'string') return step || fallbackType || '未知步骤';
   if (!step || typeof step !== 'object') {
     return fallbackType || '未知步骤';
@@ -161,12 +254,15 @@ export function describeStep(step, fallbackType = '') {
     return name ? `编辑 ${name}` : '代码编辑';
   }
   if (step.invokeSubagent?.subagents?.length) {
-    const roles = step.invokeSubagent.subagents.map((s) => s.role || s.typeName).filter(Boolean).join(', ');
+    const roles = step.invokeSubagent.subagents
+      .map((s) => s.role || s.typeName)
+      .filter(Boolean)
+      .join(', ');
     return `子代理 ${roles || '调用'}`;
   }
 
   const type = String(step.type || fallbackType || '');
-  const map = {
+  const map: Record<string, string> = {
     CORTEX_STEP_TYPE_USER_INPUT: '用户输入',
     CORTEX_STEP_TYPE_PLANNER_RESPONSE: '模型回复/工具调用',
     CORTEX_STEP_TYPE_SEARCH_WEB: '网页搜索',
@@ -180,16 +276,15 @@ export function describeStep(step, fallbackType = '') {
   return map[type] || type.replace(/^CORTEX_STEP_TYPE_/, '') || '步骤';
 }
 
-/**
- * Extract top heavyweight context consumers from the chat-messages breakdown children.
- * @param {Array<object>} groups
- * @param {Array<object>} steps
- * @param {number} contextLimit
- * @param {number} topN
- * @returns {Array<{stepIndex: number|null, label: string, tokens: number, pct: number}>}
- */
-export function extractHeavyConsumers(groups, steps = [], contextLimit = 0, topN = 8) {
-  const chatGroup = (Array.isArray(groups) ? groups : []).find((g) => g.type === 'TOKEN_TYPE_CHAT_MESSAGES');
+export function extractHeavyConsumers(
+  groups: InternalGroup[] | RawBreakdownGroup[],
+  steps: Array<TrajectoryStep | string> = [],
+  contextLimit = 0,
+  topN = 8,
+): HeavyConsumerItem[] {
+  const chatGroup = (Array.isArray(groups) ? groups : []).find(
+    (g) => g.type === 'TOKEN_TYPE_CHAT_MESSAGES',
+  );
   const children = Array.isArray(chatGroup?.children) ? chatGroup.children : [];
 
   return children
@@ -214,15 +309,14 @@ export function extractHeavyConsumers(groups, steps = [], contextLimit = 0, topN
 
 /**
  * Extract compaction checkpoint count, lightweight step labels, and subagent references.
- * Storing labels instead of raw steps keeps trajectory cache tiny in memory.
- * @param {object|null|undefined} trajectory
- * @returns {{checkpointCount: number, stepLabels: string[], subagentRefs: Array<{conversationId: string, role: string, typeName: string, status: string}>}}
  */
-export function extractTrajectoryStats(trajectory) {
+export function extractTrajectoryStats(
+  trajectory: { steps?: TrajectoryStep[] } | null | undefined,
+): TrajectoryStats {
   const steps = Array.isArray(trajectory?.steps) ? trajectory.steps : [];
   let checkpointCount = 0;
-  const stepLabels = new Array(steps.length);
-  const subagentMap = new Map();
+  const stepLabels = new Array<string>(steps.length);
+  const subagentMap = new Map<string, SubagentRef>();
 
   for (let idx = 0; idx < steps.length; idx += 1) {
     const step = steps[idx];
@@ -254,16 +348,22 @@ export function extractTrajectoryStats(trajectory) {
   };
 }
 
-/**
- * Transform GetCascadeTrajectoryGeneratorMetadata entries into telemetry summary and turn list.
- * @param {Array<object>} generatorMetadata
- * @param {{checkpointCount?: number, steps?: Array<object>, subagents?: object, pricingMap?: Map, pricingSource?: string}|null} extra
- * @returns {object}
- */
-export function buildTelemetryReport(generatorMetadata, extra = null) {
+export interface BuildTelemetryExtra {
+  checkpointCount?: number;
+  steps?: TrajectoryStep[];
+  stepLabels?: string[];
+  subagents?: SubagentSummary;
+  pricingMap?: Map<string, ModelPriceRate>;
+  pricingSource?: string;
+}
+
+export function buildTelemetryReport(
+  generatorMetadata: GeneratorMetadataEntry[],
+  extra: BuildTelemetryExtra | null = null,
+): TelemetryReport {
   const entries = Array.isArray(generatorMetadata) ? generatorMetadata : [];
-  const pricingMap = extra?.pricingMap || null;
-  const turns = [];
+  const pricingMap = extra?.pricingMap ?? null;
+  const turns: ParsedTurn[] = [];
 
   let totalInputTokens = 0;
   let totalCacheReadTokens = 0;
@@ -275,7 +375,7 @@ export function buildTelemetryReport(generatorMetadata, extra = null) {
   let pricedTurns = 0;
   let tpsOutputSum = 0;
   let tpsStreamSecSum = 0;
-  const ttftSamples = [];
+  const ttftSamples: number[] = [];
 
   for (const entry of entries) {
     const turn = parseTurn(entry, turns.length + 1);
@@ -283,7 +383,7 @@ export function buildTelemetryReport(generatorMetadata, extra = null) {
 
     const rate = resolveModelPrice(pricingMap, turn.responseModel, turn.model);
     const costUsd = computeTurnCostUsd(turn, rate);
-    if (costUsd !== null) {
+    if (costUsd !== null && rate) {
       totalCostUsd += costUsd;
       totalCacheSavedUsd += turn.cacheReadTokens * Math.max(0, rate.prompt - rate.cacheRead);
       pricedTurns += 1;
@@ -297,7 +397,7 @@ export function buildTelemetryReport(generatorMetadata, extra = null) {
     totalThinkingTokens += turn.thinkingTokens;
     totalResponseTokens += turn.responseTokens;
 
-    if (turn.tps !== null) {
+    if (turn.tps !== null && turn.streamSec !== null) {
       tpsOutputSum += turn.outputTokens;
       tpsStreamSecSum += turn.streamSec;
     }
@@ -311,11 +411,15 @@ export function buildTelemetryReport(generatorMetadata, extra = null) {
   const totalPromptTokens = totalInputTokens + totalCacheReadTokens;
   const sessionCacheHitPct = totalPromptTokens > 0 ? (totalCacheReadTokens / totalPromptTokens) * 100 : null;
   const latestGroups = latestWithGroups?.groups || [];
-  const heavyConsumers = extractHeavyConsumers(latestGroups, extra?.stepLabels || extra?.steps || [], latest?.contextLimit || 0);
+  const heavyConsumers = extractHeavyConsumers(
+    latestGroups,
+    extra?.stepLabels || extra?.steps || [],
+    latest?.contextLimit || 0,
+  );
 
   return {
     model: latest?.model || 'No active turn',
-    pricingSource: extra?.pricingSource || (pricedTurns > 0 ? 'openrouter' : 'unavailable'),
+    pricingSource: extra?.pricingSource || (pricedTurns > 0 ? 'models.dev' : 'unavailable'),
     context: latest
       ? {
           used: latest.contextUsed,
@@ -326,7 +430,15 @@ export function buildTelemetryReport(generatorMetadata, extra = null) {
           groups: latestGroups.map(({ name, type, tokens }) => ({ name, type, tokens })),
           heavyConsumers,
         }
-      : { used: 0, limit: 0, pct: 0, level: 'ok', checkpointCount: extra?.checkpointCount ?? 0, groups: [], heavyConsumers: [] },
+      : {
+          used: 0,
+          limit: 0,
+          pct: 0,
+          level: 'ok',
+          checkpointCount: extra?.checkpointCount ?? 0,
+          groups: [],
+          heavyConsumers: [],
+        },
     latest: latest
       ? {
           tps: latest.tps,
@@ -360,36 +472,36 @@ export function buildTelemetryReport(generatorMetadata, extra = null) {
       totalOutputTokens: 0,
       items: [],
     },
-    turns: turns.slice(-RECENT_TURNS_LIMIT).reverse().map(({ groups: _groups, responseModel: _rm, ...rest }) => rest),
+    turns: turns
+      .slice(-RECENT_TURNS_LIMIT)
+      .reverse()
+      .map(({ groups: _groups, responseModel: _rm, ...rest }) => rest),
   };
 }
 
-/**
- * Aggregate per-subagent telemetry summaries into a unified subagent report.
- * @param {Array<{ref: object, report: object}>} entries
- * @returns {object}
- */
-export function buildSubagentSummary(entries) {
+export function buildSubagentSummary(
+  entries: Array<{ ref: SubagentRef; report: TelemetryReport }>,
+): SubagentSummary {
   let totalInputTokens = 0;
   let totalCacheReadTokens = 0;
   let totalOutputTokens = 0;
-  const items = [];
+  const items: SubagentItem[] = [];
 
   for (const { ref, report } of entries) {
-    const sess = report?.session || {};
-    totalInputTokens += sess.totalInputTokens || 0;
-    totalCacheReadTokens += sess.totalCacheReadTokens || 0;
-    totalOutputTokens += sess.totalOutputTokens || 0;
+    const sess = report?.session;
+    totalInputTokens += sess?.totalInputTokens || 0;
+    totalCacheReadTokens += sess?.totalCacheReadTokens || 0;
+    totalOutputTokens += sess?.totalOutputTokens || 0;
     items.push({
       conversationId: ref.conversationId,
       role: ref.role,
       typeName: ref.typeName,
       model: report?.model || 'Unknown',
-      turnsCount: sess.turnsCount || 0,
-      inputTokens: sess.totalInputTokens || 0,
-      cacheReadTokens: sess.totalCacheReadTokens || 0,
-      outputTokens: sess.totalOutputTokens || 0,
-      avgTps: sess.avgTps ?? null,
+      turnsCount: sess?.turnsCount || 0,
+      inputTokens: sess?.totalInputTokens || 0,
+      cacheReadTokens: sess?.totalCacheReadTokens || 0,
+      outputTokens: sess?.totalOutputTokens || 0,
+      avgTps: sess?.avgTps ?? null,
     });
   }
 
@@ -402,11 +514,7 @@ export function buildSubagentSummary(entries) {
   };
 }
 
-/**
- * Resolve the Antigravity appData directory (e.g. ~/.gemini/antigravity).
- * @returns {string}
- */
-export function resolveAppDataDir() {
+export function resolveAppDataDir(): string {
   if (process.env.ANTIGRAVITY_APP_DATA_DIR && existsSync(process.env.ANTIGRAVITY_APP_DATA_DIR)) {
     return process.env.ANTIGRAVITY_APP_DATA_DIR;
   }
@@ -423,18 +531,13 @@ export function resolveAppDataDir() {
   return join(geminiDir, 'antigravity');
 }
 
-/**
- * Discover Language Server endpoints (cached 15s; env first, then recent daemon/hub_*.json files).
- * @param {boolean} bypassCache
- * @returns {Array<{address: string, csrfToken: string}>}
- */
-export function discoverLanguageServers(bypassCache = false) {
+export function discoverLanguageServers(bypassCache = false): LsEndpoint[] {
   const now = Date.now();
   if (!bypassCache && cachedEndpoints && now - endpointsCachedAt < ENDPOINTS_TTL_MS) {
     return cachedEndpoints;
   }
 
-  const candidates = [];
+  const candidates: LsEndpoint[] = [];
   if (process.env.ANTIGRAVITY_LS_ADDRESS && process.env.ANTIGRAVITY_CSRF_TOKEN) {
     candidates.push({
       address: process.env.ANTIGRAVITY_LS_ADDRESS,
@@ -455,7 +558,10 @@ export function discoverLanguageServers(bypassCache = false) {
 
       for (const file of files.slice(0, 5)) {
         try {
-          const data = JSON.parse(readFileSync(file.full, 'utf-8'));
+          const data = JSON.parse(readFileSync(file.full, 'utf-8')) as {
+            httpPort?: number;
+            csrfToken?: string;
+          };
           if (data?.httpPort && data?.csrfToken) {
             const addr = `127.0.0.1:${data.httpPort}`;
             if (!candidates.some((c) => c.address === addr)) {
@@ -476,35 +582,35 @@ export function discoverLanguageServers(bypassCache = false) {
   return candidates;
 }
 
-/**
- * Call LanguageServerService RPC over HTTP with automatic fallback across discovered endpoints.
- * @param {string} method
- * @param {object} body
- * @returns {Promise<object>}
- */
-export async function callLsRpc(method, body = {}) {
+export async function callLsRpc<T = unknown>(
+  method: string,
+  body: Record<string, unknown> = {},
+): Promise<T> {
   let endpoints = discoverLanguageServers(false);
   let lastErr = new Error('No Antigravity Language Server endpoint found');
 
   for (let pass = 0; pass < 2; pass += 1) {
     for (const ep of endpoints) {
       try {
-        const res = await fetch(`http://${ep.address}/exa.language_server_pb.LanguageServerService/${method}`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-codeium-csrf-token': ep.csrfToken,
+        const res = await fetch(
+          `http://${ep.address}/exa.language_server_pb.LanguageServerService/${method}`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-codeium-csrf-token': ep.csrfToken,
+            },
+            body: JSON.stringify(body),
+            signal: AbortSignal.timeout(4000),
           },
-          body: JSON.stringify(body),
-          signal: AbortSignal.timeout(4000),
-        });
+        );
         if (!res.ok) {
           lastErr = new Error(`LS RPC ${method} HTTP ${res.status}`);
           continue;
         }
-        return await res.json();
+        return (await res.json()) as T;
       } catch (err) {
-        lastErr = err;
+        lastErr = err instanceof Error ? err : new Error(String(err));
       }
     }
     if (pass === 0) endpoints = discoverLanguageServers(true);
@@ -513,15 +619,17 @@ export async function callLsRpc(method, body = {}) {
   throw lastErr;
 }
 
-/**
- * List recent conversations sorted by lastModifiedTime descending, plus child-parent map.
- * @returns {Promise<{conversations: Array<object>, childrenByRoot: Map<string, Array<object>>}>}
- */
-export async function fetchConversations() {
-  const res = await callLsRpc('GetAllCascadeTrajectories', {});
+export async function fetchConversations(): Promise<{
+  conversations: ConversationSummary[];
+  childrenByRoot: Map<string, SubagentRef[]>;
+}> {
+  const res = await callLsRpc<{ trajectorySummaries?: Record<string, TrajectorySummaryRaw> }>(
+    'GetAllCascadeTrajectories',
+    {},
+  );
   const summaries = res?.trajectorySummaries || {};
-  const conversations = [];
-  const childrenByRoot = new Map();
+  const conversations: ConversationSummary[] = [];
+  const childrenByRoot = new Map<string, SubagentRef[]>();
 
   for (const [id, s] of Object.entries(summaries)) {
     const rootId = s.trajectoryMetadata?.rootConversationId;
@@ -545,29 +653,32 @@ export async function fetchConversations() {
     });
   }
 
-  conversations.sort((a, b) => String(b.lastModifiedTime).localeCompare(String(a.lastModifiedTime)));
+  conversations.sort((a, b) =>
+    String(b.lastModifiedTime).localeCompare(String(a.lastModifiedTime)),
+  );
   return { conversations, childrenByRoot };
 }
 
-/**
- * Fetch trajectory stats (checkpoints, steps, subagents) with optional stepCount cache.
- * @param {string} conversationId
- * @param {number|null} stepCount
- * @param {Map<string, {stepCount: number|null, stats: object}>} trajCache
- * @returns {Promise<object>}
- */
-async function getTrajectoryStatsCached(conversationId, stepCount, trajCache) {
+async function getTrajectoryStatsCached(
+  conversationId: string,
+  stepCount: number | null,
+  trajCache?: Map<string, CachedTrajectoryEntry>,
+): Promise<TrajectoryStats> {
   const cached = trajCache?.get(conversationId);
   if (cached && stepCount !== null && cached.stepCount === stepCount) {
     return cached.stats;
   }
   try {
-    const trajRes = await callLsRpc('GetCascadeTrajectory', { cascadeId: conversationId });
+    const trajRes = await callLsRpc<{ trajectory?: { steps?: TrajectoryStep[] } }>(
+      'GetCascadeTrajectory',
+      { cascadeId: conversationId },
+    );
     const stats = extractTrajectoryStats(trajRes?.trajectory);
     if (trajCache) {
       trajCache.set(conversationId, { stepCount, stats });
       while (trajCache.size > 10) {
-        trajCache.delete(trajCache.keys().next().value);
+        const oldest = trajCache.keys().next().value;
+        if (oldest !== undefined) trajCache.delete(oldest);
       }
     }
     return stats;
@@ -576,20 +687,28 @@ async function getTrajectoryStatsCached(conversationId, stepCount, trajCache) {
   }
 }
 
-/**
- * Fetch and build full telemetry report (including checkpoints, top consumers, subagents, and pricing).
- * Caches completed subagent reports to avoid redundant RPCs on every poll.
- * @param {string} conversationId
- * @param {{stepCount?: number|null, extraChildren?: Array<object>, trajCache?: Map, subCache?: Map, pricingMap?: Map, pricingSource?: string}} options
- * @returns {Promise<object>}
- */
-export async function fetchTelemetry(conversationId, options = {}) {
+export interface FetchTelemetryOptions {
+  stepCount?: number | null;
+  extraChildren?: SubagentRef[];
+  trajCache?: Map<string, CachedTrajectoryEntry>;
+  subCache?: Map<string, CachedSubagentEntry>;
+  pricingMap?: Map<string, ModelPriceRate>;
+  pricingSource?: string;
+}
+
+export async function fetchTelemetry(
+  conversationId: string,
+  options: FetchTelemetryOptions = {},
+): Promise<TelemetryReport> {
   const [gmRes, stats] = await Promise.all([
-    callLsRpc('GetCascadeTrajectoryGeneratorMetadata', { cascadeId: conversationId }),
+    callLsRpc<{ generatorMetadata?: GeneratorMetadataEntry[] }>(
+      'GetCascadeTrajectoryGeneratorMetadata',
+      { cascadeId: conversationId },
+    ),
     getTrajectoryStatsCached(conversationId, options.stepCount ?? null, options.trajCache),
   ]);
 
-  const refMap = new Map();
+  const refMap = new Map<string, SubagentRef>();
   for (const r of stats.subagentRefs) refMap.set(r.conversationId, r);
   for (const r of options.extraChildren || []) {
     if (!refMap.has(r.conversationId)) refMap.set(r.conversationId, r);
@@ -599,17 +718,26 @@ export async function fetchTelemetry(conversationId, options = {}) {
   const subCache = options.subCache;
   const subEntries = await Promise.all(
     subRefs.map(async (ref) => {
-      const isDone = ref.status === 'CORTEX_STEP_STATUS_DONE' || ref.status === 'CASCADE_RUN_STATUS_IDLE';
+      const isDone =
+        ref.status === 'CORTEX_STEP_STATUS_DONE' || ref.status === 'CASCADE_RUN_STATUS_IDLE';
       const cached = subCache?.get(ref.conversationId);
       if (cached && isDone && cached.pricingSource === options.pricingSource) {
         return { ref, report: cached.report };
       }
       try {
-        const subGm = await callLsRpc('GetCascadeTrajectoryGeneratorMetadata', { cascadeId: ref.conversationId });
-        const report = buildTelemetryReport(subGm?.generatorMetadata || [], { pricingMap: options.pricingMap });
+        const subGm = await callLsRpc<{ generatorMetadata?: GeneratorMetadataEntry[] }>(
+          'GetCascadeTrajectoryGeneratorMetadata',
+          { cascadeId: ref.conversationId },
+        );
+        const report = buildTelemetryReport(subGm?.generatorMetadata || [], {
+          pricingMap: options.pricingMap,
+        });
         if (subCache && isDone) {
           subCache.set(ref.conversationId, { report, pricingSource: options.pricingSource });
-          while (subCache.size > 40) subCache.delete(subCache.keys().next().value);
+          while (subCache.size > 40) {
+            const oldest = subCache.keys().next().value;
+            if (oldest !== undefined) subCache.delete(oldest);
+          }
         }
         return { ref, report };
       } catch {

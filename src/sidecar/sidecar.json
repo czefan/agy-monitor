@@ -1,6 +1,6 @@
 {
   "command": "node",
-  "args": ["main.mjs"],
+  "args": ["sidecar/main.js"],
   "restart_policy": "always",
   "display_name": "AGY Monitor",
   "description": "Live context window, TPS, TTFT, and prompt cache hit monitor for the active Antigravity conversation.",

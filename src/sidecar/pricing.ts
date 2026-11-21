@@ -4,14 +4,36 @@ import { dirname, join } from 'node:path';
 const MODELS_DEV_URL = 'https://models.dev/api.json';
 export const PRICING_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const RETRY_COOLDOWN_MS = 5 * 60 * 1000;
-const PREFERRED_PROVIDERS = ['google', 'anthropic', 'openai', 'togetherai'];
+const PREFERRED_PROVIDERS = ['google', 'anthropic', 'openai', 'togetherai'] as const;
 
-/**
- * Normalize model identifiers across Antigravity and models.dev.
- * @param {string} raw
- * @returns {string}
- */
-export function normalizeModelKey(raw) {
+export interface ModelPriceRate {
+  id: string;
+  prompt: number;
+  completion: number;
+  cacheRead: number;
+}
+
+export interface ModelsDevModel {
+  name?: string;
+  cost?: {
+    input?: number;
+    output?: number;
+    cache_read?: number;
+  };
+}
+
+export interface ModelsDevProvider {
+  models?: Record<string, ModelsDevModel>;
+}
+
+export type ModelsDevCatalog = Record<string, ModelsDevProvider | undefined>;
+
+interface DiskPricingCache {
+  fetchedAt?: number;
+  entries?: Array<[string, ModelPriceRate]>;
+}
+
+export function normalizeModelKey(raw: string | null | undefined): string {
   return String(raw || '')
     .toLowerCase()
     .replace(/^[^/]+\//, '')
@@ -22,23 +44,23 @@ export function normalizeModelKey(raw) {
 }
 
 /**
- * Build a lookup map from models.dev /api.json (prices in USD per 1M tokens).
- * Prioritizes first-party providers (google, anthropic, openai) over third-party hosts.
- * @param {object} catalog
- * @returns {Map<string, {id: string, prompt: number, completion: number, cacheRead: number}>}
+ * Build a lookup map from models.dev /api.json (prices converted from per-1M USD to per-token USD).
+ * Prioritizes first-party providers over third-party hosts.
  */
-export function buildModelsDevPricingMap(catalog) {
-  const map = new Map();
+export function buildModelsDevPricingMap(catalog: unknown): Map<string, ModelPriceRate> {
+  const map = new Map<string, ModelPriceRate>();
   if (!catalog || typeof catalog !== 'object') return map;
 
-  const allProviders = Object.keys(catalog);
+  const typedCatalog = catalog as ModelsDevCatalog;
+  const allProviders = Object.keys(typedCatalog);
+  const preferredSet = new Set<string>(PREFERRED_PROVIDERS);
   const orderedProviders = [
-    ...PREFERRED_PROVIDERS.filter((p) => catalog[p]),
-    ...allProviders.filter((p) => !PREFERRED_PROVIDERS.includes(p)),
+    ...PREFERRED_PROVIDERS.filter((p) => Boolean(typedCatalog[p])),
+    ...allProviders.filter((p) => !preferredSet.has(p)),
   ];
 
   for (const provId of orderedProviders) {
-    const models = catalog[provId]?.models;
+    const models = typedCatalog[provId]?.models;
     if (!models || typeof models !== 'object') continue;
 
     for (const [modelId, model] of Object.entries(models)) {
@@ -48,11 +70,10 @@ export function buildModelsDevPricingMap(catalog) {
 
       const prompt = cost.input / 1e6;
       const completion = cost.output / 1e6;
-      const cacheRead = typeof cost.cache_read === 'number' && cost.cache_read >= 0
-        ? cost.cache_read / 1e6
-        : prompt;
+      const cacheRead =
+        typeof cost.cache_read === 'number' && cost.cache_read >= 0 ? cost.cache_read / 1e6 : prompt;
 
-      const entry = { id: `${provId}/${modelId}`, prompt, completion, cacheRead };
+      const entry: ModelPriceRate = { id: `${provId}/${modelId}`, prompt, completion, cacheRead };
       for (const rawKey of [modelId, model?.name]) {
         const key = normalizeModelKey(rawKey);
         if (key && !map.has(key)) map.set(key, entry);
@@ -62,29 +83,23 @@ export function buildModelsDevPricingMap(catalog) {
   return map;
 }
 
-/**
- * Resolve per-token rates for a turn's responseModel or modelDisplayName.
- * @param {Map<string, object>|null|undefined} pricingMap
- * @param {string} responseModel
- * @param {string} displayName
- * @returns {{id: string, prompt: number, completion: number, cacheRead: number}|null}
- */
-export function resolveModelPrice(pricingMap, responseModel, displayName) {
+export function resolveModelPrice(
+  pricingMap: Map<string, ModelPriceRate> | null | undefined,
+  responseModel: string | null | undefined,
+  displayName: string | null | undefined,
+): ModelPriceRate | null {
   if (!pricingMap || !pricingMap.size) return null;
   for (const candidate of [responseModel, displayName]) {
     const key = normalizeModelKey(candidate);
-    if (key && pricingMap.has(key)) return pricingMap.get(key);
+    if (key && pricingMap.has(key)) return pricingMap.get(key) ?? null;
   }
   return null;
 }
 
-/**
- * Compute USD cost for token counts given per-token rates.
- * @param {{inputTokens: number, cacheReadTokens: number, outputTokens: number}} usage
- * @param {{prompt: number, completion: number, cacheRead: number}|null} rate
- * @returns {number|null}
- */
-export function computeTurnCostUsd(usage, rate) {
+export function computeTurnCostUsd(
+  usage: { inputTokens: number; cacheReadTokens: number; outputTokens: number },
+  rate: ModelPriceRate | null,
+): number | null {
   if (!rate) return null;
   return (
     (usage.inputTokens || 0) * rate.prompt +
@@ -97,21 +112,23 @@ export function computeTurnCostUsd(usage, rate) {
  * Persistent 6-hour cached fetcher for models.dev pricing (fails softly when offline).
  */
 export class PricingCatalog {
-  constructor(cacheFile = null) {
+  readonly cacheFile: string | null;
+  map: Map<string, ModelPriceRate> = new Map();
+  fetchedAt = 0;
+  lastAttemptAt = 0;
+  inFlight: Promise<Map<string, ModelPriceRate>> | null = null;
+  source: 'pending' | 'models.dev' | 'unavailable' = 'pending';
+
+  constructor(cacheFile: string | null = null) {
     const dataDir = process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR;
     this.cacheFile = cacheFile ?? (dataDir ? join(dataDir, 'pricing-cache.json') : null);
-    this.map = new Map();
-    this.fetchedAt = 0;
-    this.lastAttemptAt = 0;
-    this.inFlight = null;
-    this.source = 'pending';
     this.loadDiskCache();
   }
 
-  loadDiskCache() {
+  private loadDiskCache(): void {
     if (!this.cacheFile || !existsSync(this.cacheFile)) return;
     try {
-      const saved = JSON.parse(readFileSync(this.cacheFile, 'utf-8'));
+      const saved = JSON.parse(readFileSync(this.cacheFile, 'utf-8')) as DiskPricingCache;
       if (Array.isArray(saved?.entries) && saved.entries.length > 0) {
         this.map = new Map(saved.entries);
         this.fetchedAt = Number(saved.fetchedAt || 0);
@@ -122,7 +139,7 @@ export class PricingCatalog {
     }
   }
 
-  saveDiskCache() {
+  private saveDiskCache(): void {
     if (!this.cacheFile || this.map.size === 0) return;
     try {
       mkdirSync(dirname(this.cacheFile), { recursive: true });
@@ -135,7 +152,7 @@ export class PricingCatalog {
     }
   }
 
-  async refreshIfNeeded() {
+  async refreshIfNeeded(): Promise<Map<string, ModelPriceRate>> {
     const now = Date.now();
     if (this.map.size > 0 && now - this.fetchedAt < PRICING_CACHE_TTL_MS) return this.map;
     if (now - this.lastAttemptAt < RETRY_COOLDOWN_MS) return this.map;
@@ -145,7 +162,7 @@ export class PricingCatalog {
     this.inFlight = (async () => {
       try {
         const res = await fetch(MODELS_DEV_URL, {
-          headers: { 'User-Agent': 'agy-monitor/0.1' },
+          headers: { 'User-Agent': 'agy-monitor' },
           signal: AbortSignal.timeout(8000),
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);

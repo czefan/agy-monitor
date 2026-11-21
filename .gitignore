@@ -1,5 +1,6 @@
 node_modules/
 dist/
+release-stage/
 *.log
 *.zip
 pricing-cache.json

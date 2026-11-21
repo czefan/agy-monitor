@@ -15,15 +15,12 @@ jobs:
         node-version: ['22', '24']
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
-      - name: Syntax check
-        run: |
-          node --check sidecars/agy-monitor/main.mjs
-          node --check sidecars/agy-monitor/telemetry.mjs
-          node --check sidecars/agy-monitor/pricing.mjs
-          node --check sidecars/agy-monitor/cdp.mjs
-          node --check sidecars/agy-monitor/app.js
-      - name: Run unit tests
-        run: node --test tests/telemetry.test.mjs
+          cache: 'pnpm'
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck, build, and test
+        run: pnpm check

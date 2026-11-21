@@ -1,7 +1,7 @@
 <div align="center">
   <img src="./assets/logo.svg" width="128" height="128" alt="AGY Monitor Logo">
   <h1>AGY Monitor</h1>
-  <p>适用于 Google Antigravity 2.0 桌面端的监控插件，基于 Node.js ESM 与原生 HTML/CSS/JS 实现，无第三方运行时依赖，无需构建。</p>
+  <p>适用于 Google Antigravity 2.0 桌面端的监控插件，源码采用严格模式 TypeScript 编写，通过 tsc 编译为原生 Node.js ESM 与前端 JS 运行，无第三方运行时依赖。</p>
 </div>
 
 ## 界面预览
@@ -40,19 +40,18 @@
    - **macOS / Linux**：`~/.gemini/config/plugins/agy-monitor/`
 3. 重启 Antigravity 2.0，在 **Customizations → Installed** 中确认启用 **AGY Monitor**，随后在对话右侧辅助栏打开 **AGY Monitor**。
 
-### 方式二：通过 Git 克隆
+### 方式二：从源码克隆与构建
 
-```powershell
-# Windows (PowerShell)
-git clone https://github.com/czefan/agy-monitor.git "$env:USERPROFILE\.gemini\config\plugins\agy-monitor"
-```
+由于仓库仅保留 TypeScript 源码，不提交编译产物，从源码安装需使用 `pnpm` 构建并同步到插件目录（Windows / macOS / Linux 通用）：
 
 ```bash
-# macOS / Linux
-git clone https://github.com/czefan/agy-monitor.git ~/.gemini/config/plugins/agy-monitor
+git clone https://github.com/czefan/agy-monitor.git
+cd agy-monitor
+pnpm install
+pnpm sync
 ```
 
-> **说明（Windows）**：Antigravity 在 Windows 下扫描插件时会跳过 NTFS 目录联接（`mklink /J`）或符号链接，需使用真实目录。
+> **说明（Windows）**：Antigravity 在 Windows 下扫描插件时会跳过 NTFS 目录联接（`mklink /J`）或符号链接，需使用真实目录（`pnpm sync` 会直接复制构建产物到真实目录）。
 
 ---
 
@@ -70,9 +69,3 @@ Antigravity 2.0 桌面端默认未开启远程调试端口，初始状态下仅�
 
 - 会话与性能数据均从本地 Language Server RPC（`127.0.0.1`）读取，不上传对话内容、代码或凭证。
 - 模型单价每 6 小时请求一次公开只读接口 `https://models.dev/api.json`。
-
----
-
-## 贡献与协议
-
-贡献说明见 [CONTRIBUTING.md](./CONTRIBUTING.md)。本项目使用 [MIT License](./LICENSE)。
